@@ -159,7 +159,11 @@ jobs:
 
           test -n "$(find awgrelease -maxdepth 1 -name '*.ipk' -print -quit)"
 
-          "${SDK_DIR}/scripts/ipkg-make-index.sh" awgrelease > awgrelease/Packages
+          echo "Collected packages:"
+          find awgrelease -maxdepth 1 -name '*.ipk' -printf '%f\n' | sort
+
+          MKHASH="${SDK_DIR}/staging_dir/host/bin/mkhash" \
+            "${SDK_DIR}/scripts/ipkg-make-index.sh" awgrelease > awgrelease/Packages
           gzip -9nc awgrelease/Packages > awgrelease/Packages.gz
 
           (
