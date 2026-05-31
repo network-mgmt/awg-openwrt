@@ -1,0 +1,176 @@
+name: Build Redmi AX3000 packages
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Optional kmiit/Redmi_AX3000_immortalwrt release tag. Empty means latest ci-redmi_ax3000-24.10-* release."
+        required: false
+        default: ""
+      sdk_url:
+        description: "Optional direct SDK URL. Overrides release_tag lookup."
+        required: false
+        default: ""
+      target:
+        description: "OpenWrt target"
+        required: true
+        default: "qualcommax"
+      subtarget:
+        description: "OpenWrt subtarget"
+        required: true
+        default: "ipq50xx"
+      profile:
+        description: "OpenWrt device profile"
+        required: true
+        default: "DEVICE_redmi_ax3000"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      FIRMWARE_REPO: kmiit/Redmi_AX3000_immortalwrt
+      FIRMWARE_BRANCH: redmi_ax3000-24.10
+      RELEASE_TAG_INPUT: ${{ inputs.release_tag }}
+      SDK_URL_INPUT: ${{ inputs.sdk_url }}
+      TARGET: ${{ inputs.target }}
+      SUBTARGET: ${{ inputs.subtarget }}
+      PROFILE: ${{ inputs.profile }}
+
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android
+
+      - name: Install dependencies
+        run: |
+          sudo bash -c 'bash <(curl -s https://build-scripts.immortalwrt.org/init_build_environment.sh)'
+          sudo apt-get update
+          sudo apt-get install -y fakeroot jq python3-pyelftools zstd
+
+      - name: Checkout AWG packages
+        uses: actions/checkout@v4
+
+      - name: Resolve SDK
+        id: sdk
+        run: |
+          set -euo pipefail
+
+          if [ -n "${SDK_URL_INPUT}" ]; then
+            sdk_url="${SDK_URL_INPUT}"
+            release_tag="${RELEASE_TAG_INPUT:-custom-sdk}"
+          else
+            if [ -n "${RELEASE_TAG_INPUT}" ]; then
+              release_json="$(curl -fsSL "https://api.github.com/repos/${FIRMWARE_REPO}/releases/tags/${RELEASE_TAG_INPUT}")"
+            else
+              release_json="$(
+                curl -fsSL "https://api.github.com/repos/${FIRMWARE_REPO}/releases?per_page=30" |
+                jq -er --arg prefix "ci-${FIRMWARE_BRANCH}-" \
+                  'map(select(.tag_name | startswith($prefix))) | first'
+              )"
+            fi
+
+            release_tag="$(jq -er '.tag_name' <<<"${release_json}")"
+            sdk_url="$(
+              jq -er --arg target "${TARGET}" --arg subtarget "${SUBTARGET}" \
+                '.assets[].browser_download_url |
+                 select(test("immortalwrt-sdk-" + $target + "-" + $subtarget + "_.*Linux-x86_64\\.tar\\.(zst|xz)$"))' \
+                <<<"${release_json}"
+            )"
+          fi
+
+          echo "release_tag=${release_tag}" >> "$GITHUB_OUTPUT"
+          echo "sdk_url=${sdk_url}" >> "$GITHUB_OUTPUT"
+          echo "Release tag: ${release_tag}"
+          echo "SDK URL: ${sdk_url}"
+
+      - name: Download and extract SDK
+        run: |
+          set -euo pipefail
+
+          mkdir -p .sdk
+          curl -L --fail --show-error --progress-bar \
+            -o .sdk/sdk.tar "${{ steps.sdk.outputs.sdk_url }}"
+
+          case "${{ steps.sdk.outputs.sdk_url }}" in
+            *.tar.zst) tar --zstd -xf .sdk/sdk.tar -C .sdk ;;
+            *.tar.xz) tar -xf .sdk/sdk.tar -C .sdk ;;
+            *) echo "Unsupported SDK archive format"; exit 1 ;;
+          esac
+
+          sdk_dir="$(find .sdk -maxdepth 1 -mindepth 1 -type d | head -n1)"
+          [ -n "${sdk_dir}" ]
+          echo "SDK_DIR=${sdk_dir}" >> "$GITHUB_ENV"
+
+      - name: Configure SDK
+        run: |
+          set -euo pipefail
+
+          cd "${SDK_DIR}"
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+          rm -rf package/kmod-amneziawg package/amneziawg-tools package/luci-proto-amneziawg
+          cp -r "${GITHUB_WORKSPACE}/kmod-amneziawg" package/
+          cp -r "${GITHUB_WORKSPACE}/amneziawg-tools" package/
+          cp -r "${GITHUB_WORKSPACE}/luci-proto-amneziawg" package/
+
+          cat > .config <<EOF
+          # CONFIG_ALL_NONSHARED is not set
+          # CONFIG_ALL_KMODS is not set
+          # CONFIG_ALL is not set
+          CONFIG_TARGET_${TARGET}=y
+          CONFIG_TARGET_${TARGET}_${SUBTARGET}=y
+          CONFIG_TARGET_${TARGET}_${SUBTARGET}_${PROFILE}=y
+          CONFIG_LUCI_LANG_ru=y
+          CONFIG_PACKAGE_kmod-amneziawg=m
+          CONFIG_PACKAGE_amneziawg-tools=y
+          CONFIG_PACKAGE_luci-proto-amneziawg=y
+          CONFIG_PACKAGE_ip-tiny=m
+          EOF
+
+          sed -i 's/^          //' .config
+          make defconfig
+
+      - name: Build AmneziaWG packages
+        run: |
+          set -euo pipefail
+
+          cd "${SDK_DIR}"
+          make package/kmod-amneziawg/download V=s
+          make package/amneziawg-tools/download V=s
+          make package/kmod-amneziawg/compile V=s FAKEROOT=/usr/bin/fakeroot
+          make package/amneziawg-tools/compile V=s FAKEROOT=/usr/bin/fakeroot
+          make package/luci-proto-amneziawg/compile V=s FAKEROOT=/usr/bin/fakeroot
+
+      - name: Collect artifacts
+        run: |
+          set -euo pipefail
+
+          mkdir -p awgrelease
+
+          find "${SDK_DIR}/bin" -type f \( \
+            -name 'kmod-amneziawg_*.ipk' -o \
+            -name 'amneziawg-tools_*.ipk' -o \
+            -name 'luci-proto-amneziawg_*.ipk' -o \
+            -name 'luci-i18n-amneziawg-ru_*.ipk' \
+          \) -exec cp -v {} awgrelease/ \;
+
+          test -n "$(find awgrelease -maxdepth 1 -name '*.ipk' -print -quit)"
+
+          "${SDK_DIR}/scripts/ipkg-make-index.sh" awgrelease > awgrelease/Packages
+          gzip -9nc awgrelease/Packages > awgrelease/Packages.gz
+
+          (
+            cd awgrelease
+            sha256sum *.ipk > sha256sums
+          )
+
+          ls -la awgrelease
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: awg-redmi-ax3000-${{ steps.sdk.outputs.release_tag }}
+          path: awgrelease/*
